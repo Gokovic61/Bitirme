@@ -1,0 +1,143 @@
+import argparse
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+try:
+    import open3d as o3d
+except Exception:
+    o3d = None
+
+try:
+    import laspy
+except Exception:
+    laspy = None
+
+
+class GapFillingNet(nn.Module):
+    def __init__(self, input_dim: int = 3):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 256),
+            nn.ReLU(inplace=True),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, input_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(x)
+        return self.decoder(features)
+
+
+def load_point_cloud(path: Path) -> np.ndarray:
+    ext = path.suffix.lower()
+    if ext == ".las":
+        if laspy is None:
+            raise RuntimeError("laspy is required to read LAS files")
+        las = laspy.read(str(path))
+        return np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
+    else:
+        if o3d is None:
+            raise RuntimeError("open3d is required to read point clouds")
+        pcd = o3d.io.read_point_cloud(str(path))
+        return np.asarray(pcd.points, dtype=np.float32)
+
+
+def save_model(model: nn.Module, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), path)
+
+
+class PointCloudPairDataset(Dataset):
+    def __init__(self, gapped_dir: Path, complete_dir: Path):
+        self.gapped_paths = sorted(p for p in gapped_dir.iterdir() if p.is_file())
+        self.complete_dir = complete_dir
+
+    def __len__(self) -> int:
+        return len(self.gapped_paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        gapped_path = self.gapped_paths[idx]
+        complete_path = self.complete_dir / gapped_path.name
+        gapped = load_point_cloud(gapped_path)
+        complete = load_point_cloud(complete_path)
+        return torch.from_numpy(gapped), torch.from_numpy(complete)
+
+
+def train(model: nn.Module, dataloader: DataLoader, epochs: int, lr: float, device: torch.device) -> None:
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.to(device)
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        for partial, full in dataloader:
+            partial = partial[0].to(device)
+            full = full[0].to(device)
+            pred = model(partial)
+            loss = criterion(pred, full)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+
+
+def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device) -> float:
+    criterion = nn.MSELoss()
+    model.to(device)
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for partial, full in dataloader:
+            partial = partial[0].to(device)
+            full = full[0].to(device)
+            pred = model(partial)
+            total_loss += criterion(pred, full).item()
+    return total_loss / len(dataloader)
+
+
+def cli() -> None:
+    parser = argparse.ArgumentParser(description="Train a point-cloud gap filling model")
+    parser.add_argument("gapped_dir", type=Path, help="Directory with gapped point clouds")
+    parser.add_argument("complete_dir", type=Path, help="Directory with complete point clouds")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
+    parser.add_argument("--model-out", type=Path, default=Path("gap_filling_model.pth"), help="Model save path")
+    args = parser.parse_args()
+
+    dataset = PointCloudPairDataset(args.gapped_dir, args.complete_dir)
+    train_size = int(0.8 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_ds, test_ds = random_split(dataset, [train_size, test_size])
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GapFillingNet()
+
+    train(model, train_loader, args.epochs, args.lr, device)
+    test_loss = evaluate(model, test_loader, device)
+    print(f"Test MSE: {test_loss:.6f}")
+    save_model(model, args.model_out)
+
+
+if __name__ == "__main__":
+    cli()
