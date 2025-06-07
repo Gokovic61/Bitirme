@@ -1,4 +1,83 @@
-print("Codex test ortamı")
-
-
-print test kodu eklendi
+diff --git a//dev/null b/lidar_gap_fill.py
+index 0000000000000000000000000000000000000000..927244634991ab54460c9ee112bd98de2fde0408 100644
+--- a//dev/null
++++ b/lidar_gap_fill.py
+@@ -0,0 +1,78 @@
++import argparse
++from pathlib import Path
++
++import numpy as np
++
++try:
++    import torch
++    from torch import nn
++except ImportError as e:
++    raise SystemExit("PyTorch is required to run this script: {}".format(e))
++
++try:
++    import open3d as o3d
++except ImportError as e:
++    raise SystemExit("Open3D is required to run this script: {}".format(e))
++
++
++class GapFillingNet(nn.Module):
++    """Simple point-cloud autoencoder."""
++
++    def __init__(self, input_dim: int = 3):
++        super().__init__()
++        self.encoder = nn.Sequential(
++            nn.Linear(input_dim, 64),
++            nn.ReLU(inplace=True),
++            nn.Linear(64, 128),
++            nn.ReLU(inplace=True),
++            nn.Linear(128, 256),
++            nn.ReLU(inplace=True),
++        )
++        self.decoder = nn.Sequential(
++            nn.Linear(256, 128),
++            nn.ReLU(inplace=True),
++            nn.Linear(128, 64),
++            nn.ReLU(inplace=True),
++            nn.Linear(64, input_dim),
++        )
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        features = self.encoder(x)
++        return self.decoder(features)
++
++
++def load_point_cloud(path: Path) -> np.ndarray:
++    """Load point cloud from a supported Open3D format."""
++    pcd = o3d.io.read_point_cloud(str(path))
++    return np.asarray(pcd.points, dtype=np.float32)
++
++
++def save_point_cloud(points: np.ndarray, path: Path) -> None:
++    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
++    o3d.io.write_point_cloud(str(path), pcd)
++
++
++def predict(model_path: Path, input_path: Path, output_path: Path) -> None:
++    model = GapFillingNet()
++    model.load_state_dict(torch.load(model_path, map_location="cpu"))
++    model.eval()
++
++    points = load_point_cloud(input_path)
++    with torch.no_grad():
++        input_tensor = torch.from_numpy(points)
++        completed = model(input_tensor).numpy()
++
++    save_point_cloud(completed, output_path)
++
++
++def cli() -> None:
++    parser = argparse.ArgumentParser(description="Fill gaps in LiDAR point clouds using a trained model")
++    parser.add_argument("model", type=Path, help="Path to trained model (.pth)")
++    parser.add_argument("input", type=Path, help="Path to input point cloud with gaps")
++    parser.add_argument("output", type=Path, help="Path to save completed point cloud")
++    args = parser.parse_args()
++    predict(args.model, args.input, args.output)
++
++
++if __name__ == "__main__":
++    cli()
